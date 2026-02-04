@@ -1,26 +1,39 @@
 use std::collections::BTreeMap;
+
 use crate::error::CoreError;
 
+/// SkippedKeyStore stores message keys for out-of-order delivery.
+/// Scope: one epoch at a time (epoch mismatch is rejected by caller).
 #[derive(Clone, Debug)]
 pub struct SkippedKeyStore {
-    max: usize,
+    cap: usize,
     map: BTreeMap<u64, [u8; 32]>,
 }
 
 impl SkippedKeyStore {
-    pub fn new(max: usize) -> Self {
-        Self { max, map: BTreeMap::new() }
+    pub fn new(cap: usize) -> Self {
+        Self { cap, map: BTreeMap::new() }
     }
 
-    pub fn insert(&mut self, counter: u64, key: [u8; 32]) -> Result<(), CoreError> {
-        if self.map.len() >= self.max {
-            return Err(CoreError::InvalidEnvelope);
+    /// Put a skipped message key for `counter`.
+    /// Enforces capacity deterministically (evict oldest).
+    pub fn put(&mut self, counter: u64, mk: [u8; 32]) -> Result<(), CoreError> {
+        self.map.insert(counter, mk);
+        while self.map.len() > self.cap {
+            // evict smallest counter (oldest)
+            let k = *self.map.keys().next().unwrap();
+            self.map.remove(&k);
         }
-        self.map.insert(counter, key);
         Ok(())
     }
 
+    /// Take (consume) skipped key for `counter`.
     pub fn take(&mut self, counter: u64) -> Option<[u8; 32]> {
         self.map.remove(&counter)
+    }
+
+    /// For tests / introspection
+    pub fn len(&self) -> usize {
+        self.map.len()
     }
 }

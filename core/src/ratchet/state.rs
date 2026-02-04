@@ -127,7 +127,29 @@ impl RatchetState {
     /// Backward-compatible alias for older integration tests.
     /// Semantics: "advance send chain once" (governed).
     pub fn step_send<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
-        let _ = self.ratchet_next_message_key(gate)?;
+        if self.status != RatchetStatus::Running {
+            return Err(CoreError::RatchetLocked);
+        }
+
+        // Monotone invariant expected by tests:
+        // after one step_send(), send_counter == previous + 1
+        self.prev_send_counter = self.send_counter;
+        self.send_counter = self.send_counter.wrapping_add(1);
+
+        // Governance gate binds op_context to current send chain state.
+        let dec = gate.gate("ratchet_msg_key", &self.chain_key_send)?;
+        if !dec.allowed {
+            // rollback counters to keep state stable on deny
+            self.send_counter = self.prev_send_counter;
+            return Err(CoreError::GateBlocked(dec.human));
+        }
+
+        // Advance send chain once (derive next chain key)
+        self.chain_key_send = crate::ratchet::kdf::hkdf_expand_32(
+            &self.chain_key_send,
+            b"carthedge/ratchet/ck",
+        );
+
         Ok(())
     }
 

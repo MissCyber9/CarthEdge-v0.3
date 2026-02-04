@@ -29,7 +29,6 @@ pub struct RatchetState {
 }
 
 impl RatchetState {
-    /// Canonical constructor after handshake-derived keys.
     pub fn new(root: [u8; 32], ck_s: [u8; 32], ck_r: [u8; 32]) -> Self {
         Self {
             status: RatchetStatus::Running,
@@ -47,17 +46,14 @@ impl RatchetState {
     }
 
     /// Deterministic constructor used by offline integration tests.
-    /// This is safe: it creates a syntactically valid state; governance still applies at runtime.
     pub fn dummy() -> Self {
         Self::new([0u8; 32], [0u8; 32], [0u8; 32])
     }
 
-    /// Lock the ratchet (no cryptographic progress allowed).
     pub fn lock(&mut self) {
         self.status = RatchetStatus::Locked;
     }
 
-    /// Force recovery through governance.
     pub fn force_recover<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
         let dec = gate.gate("ratchet_recover", b"force")?;
         if !dec.allowed {
@@ -68,11 +64,7 @@ impl RatchetState {
         Ok(())
     }
 
-    /// Derive next message key from send chain (Signal-style).
-    ///
-    /// Governance:
-    /// - op_name = "ratchet_msg_key"
-    /// - op_context = chain_key_send
+    /// Canonical API: derive next message key from send chain (Signal-style).
     pub fn ratchet_next_message_key<G: QkrGate>(
         &mut self,
         gate: &G,
@@ -96,16 +88,12 @@ impl RatchetState {
         );
 
         self.chain_key_send = ck_next;
+        // NOTE: send_counter semantics for canonical API = number of derived keys
         self.send_counter = self.send_counter.wrapping_add(1);
 
         Ok(mk)
     }
 
-    /// Minimal receive-chain progress for v0.3.x (no DH-ratchet here).
-    ///
-    /// Governance:
-    /// - op_name = "ratchet_step_recv"
-    /// - op_context = chain_key_recv
     pub fn ratchet_step_recv<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
         if self.status != RatchetStatus::Running {
             return Err(CoreError::RatchetLocked);
@@ -124,13 +112,14 @@ impl RatchetState {
         Ok(())
     }
 
-    /// Backward-compatible alias for older integration tests.
-    /// Semantics: "advance send chain once" (governed).
+    /// Legacy: step_send must satisfy monotone counter tests.
+    /// Semantics: count "messages" then evolve send chain once (governed).
     pub fn step_send<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
         if self.status != RatchetStatus::Running {
             return Err(CoreError::RatchetLocked);
         }
 
+<<<<<<< Updated upstream
         // Monotone invariant expected by tests:
         // after one step_send(), send_counter == previous + 1
         self.prev_send_counter = self.send_counter;
@@ -140,11 +129,22 @@ impl RatchetState {
         let dec = gate.gate("ratchet_msg_key", &self.chain_key_send)?;
         if !dec.allowed {
             // rollback counters to keep state stable on deny
+=======
+        self.prev_send_counter = self.send_counter;
+        self.send_counter = self.send_counter.wrapping_add(1);
+
+        let dec = gate.gate("ratchet_msg_key", &self.chain_key_send)?;
+        if !dec.allowed {
+            // roll back counters to keep invariants stable on deny
+>>>>>>> Stashed changes
             self.send_counter = self.prev_send_counter;
             return Err(CoreError::GateBlocked(dec.human));
         }
 
+<<<<<<< Updated upstream
         // Advance send chain once (derive next chain key)
+=======
+>>>>>>> Stashed changes
         self.chain_key_send = crate::ratchet::kdf::hkdf_expand_32(
             &self.chain_key_send,
             b"carthedge/ratchet/ck",
@@ -153,8 +153,6 @@ impl RatchetState {
         Ok(())
     }
 
-    /// Backward-compatible alias for older integration tests.
-    /// Semantics: "advance recv chain once" (governed).
     pub fn step_recv<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
         self.ratchet_step_recv(gate)
     }

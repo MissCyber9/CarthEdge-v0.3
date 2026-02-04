@@ -1,9 +1,17 @@
 use crate::error::CoreError;
 use crate::qkr_gate::QkrGate;
-use crate::ratchet::{DhKeyPair, SkippedKeyStore};
-use crate::ratchet::hkdf_extract_and_expand_96;
+use crate::ratchet::{DhKeyPair, SkippedKeyStore, RatchetStatus};
 
+/// RatchetState: minimal Signal-like symmetric ratchet core (v0.3.x)
+/// - Governance-first: all sensitive evolution gated through QkrGate
+/// - Offline-first: deterministic behavior for tests
+///
+/// NOTE:
+/// Integration tests under `core/tests/` compile this crate as a normal dependency,
+/// therefore helpers used by those tests MUST be available without `cfg(test)`.
 pub struct RatchetState {
+    pub status: RatchetStatus,
+
     pub root_key: [u8; 32],
 
     pub chain_key_send: [u8; 32],
@@ -21,8 +29,10 @@ pub struct RatchetState {
 }
 
 impl RatchetState {
-    pub fn new(root: [u8;32], ck_s: [u8;32], ck_r: [u8;32]) -> Self {
+    /// Canonical constructor after handshake-derived keys.
+    pub fn new(root: [u8; 32], ck_s: [u8; 32], ck_r: [u8; 32]) -> Self {
         Self {
+            status: RatchetStatus::Running,
             root_key: root,
             chain_key_send: ck_s,
             chain_key_recv: ck_r,
@@ -36,58 +46,94 @@ impl RatchetState {
         }
     }
 
-    /// Perform a DH ratchet step (Signal-style).
-    /// Governance: op_name = "ratchet_dh_step", op_context = peer_pub
-    pub fn step_send<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
-        let dec = gate.gate("ratchet_step_send", &self.chain_key_send)?;
+    /// Deterministic constructor used by offline integration tests.
+    /// This is safe: it creates a syntactically valid state; governance still applies at runtime.
+    pub fn dummy() -> Self {
+        Self::new([0u8; 32], [0u8; 32], [0u8; 32])
+    }
+
+    /// Lock the ratchet (no cryptographic progress allowed).
+    pub fn lock(&mut self) {
+        self.status = RatchetStatus::Locked;
+    }
+
+    /// Force recovery through governance.
+    pub fn force_recover<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
+        let dec = gate.gate("ratchet_recover", b"force")?;
         if !dec.allowed {
             return Err(CoreError::GateBlocked(dec.human));
         }
-        self.prev_send_counter = self.send_counter;
-        self.send_counter = self.send_counter.wrapping_add(1);
+        self.status = RatchetStatus::Running;
+        self.epoch = self.epoch.wrapping_add(1);
         Ok(())
     }
 
-    pub fn step_recv<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
+    /// Derive next message key from send chain (Signal-style).
+    ///
+    /// Governance:
+    /// - op_name = "ratchet_msg_key"
+    /// - op_context = chain_key_send
+    pub fn ratchet_next_message_key<G: QkrGate>(
+        &mut self,
+        gate: &G,
+    ) -> Result<[u8; 32], CoreError> {
+        if self.status != RatchetStatus::Running {
+            return Err(CoreError::RatchetLocked);
+        }
+
+        let dec = gate.gate("ratchet_msg_key", &self.chain_key_send)?;
+        if !dec.allowed {
+            return Err(CoreError::GateBlocked(dec.human));
+        }
+
+        let mk = crate::ratchet::kdf::hkdf_expand_32(
+            &self.chain_key_send,
+            b"carthedge/ratchet/mk",
+        );
+        let ck_next = crate::ratchet::kdf::hkdf_expand_32(
+            &self.chain_key_send,
+            b"carthedge/ratchet/ck",
+        );
+
+        self.chain_key_send = ck_next;
+        self.send_counter = self.send_counter.wrapping_add(1);
+
+        Ok(mk)
+    }
+
+    /// Minimal receive-chain progress for v0.3.x (no DH-ratchet here).
+    ///
+    /// Governance:
+    /// - op_name = "ratchet_step_recv"
+    /// - op_context = chain_key_recv
+    pub fn ratchet_step_recv<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
+        if self.status != RatchetStatus::Running {
+            return Err(CoreError::RatchetLocked);
+        }
+
         let dec = gate.gate("ratchet_step_recv", &self.chain_key_recv)?;
         if !dec.allowed {
             return Err(CoreError::GateBlocked(dec.human));
         }
+
+        self.chain_key_recv = crate::ratchet::kdf::hkdf_expand_32(
+            &self.chain_key_recv,
+            b"carthedge/ratchet/ck",
+        );
         self.recv_counter = self.recv_counter.wrapping_add(1);
         Ok(())
     }
 
-    pub fn dh_ratchet<G: QkrGate>(
-        &mut self,
-        gate: &G,
-        peer_pub: [u8;32],
-    ) -> Result<(), CoreError> {
-        let dec = gate.gate("ratchet_dh_step", &peer_pub)?;
-        if !dec.allowed {
-            return Err(CoreError::GateBlocked(dec.human));
-        }
-
-        let peer = x25519_dalek::PublicKey::from(peer_pub);
-        let dh_secret = self.dh_local.dh_once(&peer);
-
-        let okm = hkdf_extract_and_expand_96(
-            &self.root_key,
-            &dh_secret,
-            b"carthedge/v0.3/dh_ratchet",
-        );
-
-        self.root_key.copy_from_slice(&okm[0..32]);
-        self.chain_key_recv.copy_from_slice(&okm[32..64]);
-        self.chain_key_send.copy_from_slice(&okm[64..96]);
-
-        self.prev_send_counter = self.send_counter;
-        self.send_counter = 0;
-        self.recv_counter = 0;
-
-        self.dh_local.regenerate();
-        self.dh_remote = Some(peer_pub);
-        self.epoch += 1;
-
+    /// Backward-compatible alias for older integration tests.
+    /// Semantics: "advance send chain once" (governed).
+    pub fn step_send<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
+        let _ = self.ratchet_next_message_key(gate)?;
         Ok(())
+    }
+
+    /// Backward-compatible alias for older integration tests.
+    /// Semantics: "advance recv chain once" (governed).
+    pub fn step_recv<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
+        self.ratchet_step_recv(gate)
     }
 }

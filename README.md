@@ -84,19 +84,6 @@ Everything here is **testable offline**.
 
 ---
 
-## 🚫 Explicitly NOT included in v0.3.x
-
-- ❌ Networking / transport
-- ❌ Identity layer
-- ❌ Persistent storage
-- ❌ Group broadcast semantics
-- ❌ UI / mobile / API
-- ❌ Production key management
-
-These are **deliberately deferred** to preserve auditability.
-
----
-
 ## 🧱 Architectural Philosophy
 
 - **Core before features**

@@ -1,50 +1,44 @@
-use std::collections::BTreeMap;
-
+use crate::channel::ChannelMember;
 use crate::error::CoreError;
 use crate::qkr_gate::QkrGate;
-use crate::channel::member::{ChannelMember, MemberId};
 
+#[derive(Default)]
 pub struct ChannelState {
-    pub channel_id: [u8;32],
-    pub channel_epoch: u64,
-    pub members: BTreeMap<MemberId, ChannelMember>,
+    pub members: Vec<ChannelMember>,
+    pub epoch: u64,
 }
 
 impl ChannelState {
-    pub fn new<G: QkrGate>(
-        gate: &G,
-        channel_id: [u8;32],
-    ) -> Result<Self, CoreError> {
-        let dec = gate.gate("channel_create", &channel_id)?;
-        if !dec.allowed {
-            return Err(CoreError::GateBlocked(dec.human));
-        }
-
-        Ok(Self {
-            channel_id,
-            channel_epoch: 0,
-            members: BTreeMap::new(),
-        })
+    pub fn new() -> Self {
+        Self { members: Vec::new(), epoch: 0 }
     }
 
-    pub fn add_member(
-        &mut self,
-        member: ChannelMember,
-    ) {
-        self.members.insert(member.member_id, member);
+    /// Add a member at the next index.
+    /// The index is the authoritative `member_ix` in v0.3.
+    pub fn add_member(&mut self, member: ChannelMember) -> u32 {
+        let ix = self.members.len() as u32;
+        self.members.push(member);
+        ix
     }
 
-    pub fn rotate<G: QkrGate>(
-        &mut self,
-        gate: &G,
-    ) -> Result<(), CoreError> {
-        let ctx = self.channel_epoch.to_le_bytes();
+    pub fn member_mut(&mut self, ix: u32) -> Result<&mut ChannelMember, CoreError> {
+        self.members.get_mut(ix as usize).ok_or(CoreError::InvalidEnvelope)
+    }
+
+    /// Channel-level epoch rotation (foundation for recovery + policy-driven resync).
+    /// Governance: op_name="channel_rotate", op_context = epoch LE bytes.
+    pub fn rotate<G: QkrGate>(&mut self, gate: &G) -> Result<(), CoreError> {
+        let ctx = self.epoch.to_le_bytes();
         let dec = gate.gate("channel_rotate", &ctx)?;
         if !dec.allowed {
             return Err(CoreError::GateBlocked(dec.human));
         }
-
-        self.channel_epoch += 1;
+        self.epoch = self.epoch.wrapping_add(1);
         Ok(())
+    }
+
+    /// Test helper
+    pub fn new_for_tests(members: Vec<ChannelMember>) -> Self {
+        Self { members, epoch: 0 }
     }
 }
